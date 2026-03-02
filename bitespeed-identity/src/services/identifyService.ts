@@ -7,13 +7,13 @@ function nowIso() {
 
 function findMatches(email?: string | null, phone?: string | null): Contact[] {
   const stmt = db.prepare(
-    `SELECT * FROM contacts WHERE (email IS NOT NULL AND email = ?) OR (phoneNumber IS NOT NULL AND phoneNumber = ?)`
+    `SELECT * FROM contacts WHERE deletedAt IS NULL AND ((email IS NOT NULL AND email = ?) OR (phoneNumber IS NOT NULL AND phoneNumber = ?))`
   );
   return stmt.all(email ?? null, phone ?? null) as Contact[];
 }
 
 function getContactsByPrimaryId(primaryId: number): Contact[] {
-  const stmt = db.prepare('SELECT * FROM contacts WHERE id = ? OR linkedId = ?');
+  const stmt = db.prepare('SELECT * FROM contacts WHERE deletedAt IS NULL AND (id = ? OR linkedId = ?)');
   return stmt.all(primaryId, primaryId) as Contact[];
 }
 
@@ -75,41 +75,45 @@ export function handleIdentifyRequest(payload: { email?: string | null; phoneNum
     throw new Error('email or phoneNumber required');
   }
 
-  const matches = findMatches(email, phone);
+  // Run reconciliation inside a DB transaction to avoid races
+  const result = db.transaction(() => {
+    const matches = findMatches(email, phone);
 
-  if (matches.length === 0) {
-    // no existing contacts -> create primary
-    const created = createContact(email, phone, 'primary', null);
-    return buildResponse(created.id);
-  }
+    if (matches.length === 0) {
+      // no existing contacts -> create primary
+      const created = createContact(email, phone, 'primary', null);
+      return buildResponse(created.id);
+    }
 
-  // collect full link set
-  const linkSet = collectLinkSet(matches);
+    // collect full link set (only non-deleted rows)
+    const linkSet = collectLinkSet(matches);
 
-  // ensure correct primary/secondary assignments
-  upsertPrimaryAndSecondaries(linkSet);
+    // ensure correct primary/secondary assignments
+    upsertPrimaryAndSecondaries(linkSet);
 
-  // refresh linkSet after possible updates
-  const primaryId = linkSet.slice().sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1))[0].id;
-  const fullSet = getContactsByPrimaryId(primaryId);
+    // refresh after updates
+    const ordered = linkSet.slice().sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+    const primaryId = ordered[0].id;
+    const fullSet = getContactsByPrimaryId(primaryId);
 
-  // if incoming has any new info not present in fullSet, create a new secondary
-  const emails = new Set<string>();
-  const phones = new Set<string>();
-  for (const c of fullSet) {
-    if (c.email) emails.add(c.email);
-    if (c.phoneNumber) phones.add(c.phoneNumber);
-  }
+    // if incoming has any new info not present in fullSet, create a new secondary
+    const emails = new Set<string>();
+    const phones = new Set<string>();
+    for (const c of fullSet) {
+      if (c.email) emails.add(c.email);
+      if (c.phoneNumber) phones.add(c.phoneNumber);
+    }
 
-  const needCreate = (email && !emails.has(email)) || (phone && !phones.has(phone));
+    const needCreate = (email && !emails.has(email)) || (phone && !phones.has(phone));
 
-  let createdSecondary: Contact | null = null;
-  if (needCreate) {
-    createdSecondary = createContact(email, phone, 'secondary', primaryId);
-    fullSet.push(createdSecondary);
-  }
+    if (needCreate) {
+      createContact(email, phone, 'secondary', primaryId);
+    }
 
-  return buildResponse(primaryId);
+    return buildResponse(primaryId);
+  })();
+
+  return result;
 }
 
 function buildResponse(primaryId: number) {
